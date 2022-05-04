@@ -1,8 +1,6 @@
-# Copyright Niantic 2019. Patent Pending. All rights reserved.
-#
-# This software is licensed under the terms of the Monodepth2 licence
-# which allows for non-commercial use only, the full terms of which are made
-# available in the LICENSE file.
+# This module is modified from the official monodepth repository
+# https://github.com/nianticlabs/monodepth2
+# You may check its license to apply the codes
 
 from __future__ import absolute_import, division, print_function
 
@@ -16,6 +14,7 @@ import torch
 import torch.utils.data as data
 from torchvision import transforms
 
+from utils import image_resize
 
 def pil_loader(path):
     # open path as file to avoid ResourceWarning
@@ -23,7 +22,6 @@ def pil_loader(path):
     with open(path, 'rb') as f:
         with Image.open(f) as img:
             return img.convert('RGB')
-
 
 class MonoDataset(data.Dataset):
     """Superclass for monocular dataloaders
@@ -46,7 +44,19 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.jpg'):
+                 img_ext='.jpg', 
+                 not_do_color_aug=False,
+                 not_do_flip=False,
+                 do_crop=False,
+                 crop_bound=[0.0, 1.0], #
+                 seg_mask='none',
+                 boxify=False,
+                 MIN_OBJECT_AREA=20,
+                 use_radar=False,
+                 use_lidar=False,
+                 min_depth=0.1,
+                 max_depth=100.0,
+                 prob_to_mask_objects=0.0, **kwargs):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -56,11 +66,25 @@ class MonoDataset(data.Dataset):
         self.num_scales = num_scales
         self.interp = Image.ANTIALIAS
 
+        # default [0, -1, 1]
         self.frame_idxs = frame_idxs
 
         self.is_train = is_train
         self.img_ext = img_ext
+        self.do_crop = do_crop
+        self.crop_bound = crop_bound
+        self.not_do_color_aug = not_do_color_aug
+        self.not_do_flip = not_do_flip
+        self.seg_mask = seg_mask
+        self.boxify = boxify
+        self.MIN_OBJECT_AREA = MIN_OBJECT_AREA
+        self.use_radar = use_radar
+        self.use_lidar = use_lidar
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.prob_to_mask_objects = prob_to_mask_objects
 
+        # PIL image loader
         self.loader = pil_loader
         self.to_tensor = transforms.ToTensor()
 
@@ -71,6 +95,7 @@ class MonoDataset(data.Dataset):
             self.contrast = (0.8, 1.2)
             self.saturation = (0.8, 1.2)
             self.hue = (-0.1, 0.1)
+            # to test if an error occur
             transforms.ColorJitter.get_params(
                 self.brightness, self.contrast, self.saturation, self.hue)
         except TypeError:
@@ -85,19 +110,22 @@ class MonoDataset(data.Dataset):
             self.resize[i] = transforms.Resize((self.height // s, self.width // s),
                                                interpolation=self.interp)
 
+        # check if depth data available
         self.load_depth = self.check_depth()
 
     def preprocess(self, inputs, color_aug):
         """Resize colour images to the required scales and augment if required
 
-        We create the color_aug object in advance and apply the same augmentation to all
-        images in this item. This ensures that all images input to the pose network receive the
-        same augmentation.
+        We create the color_aug object in advance and apply the same 
+        augmentation to all images in this item. This ensures that all images 
+        input to the pose network receive the same augmentation.
         """
+        # list(inputs) is a list composed of the keys of inputs
+        # radar or lidar does not need multiple scales
         for k in list(inputs):
-            frame = inputs[k]
-            if "color" in k:
-                n, im, i = k
+            if "color" in k or "mask" in k:
+                n, im, _ = k
+                # save images resized to different scales to inputs
                 for i in range(self.num_scales):
                     inputs[(n, im, i)] = self.resize[i](inputs[(n, im, i - 1)])
 
@@ -105,8 +133,155 @@ class MonoDataset(data.Dataset):
             f = inputs[k]
             if "color" in k:
                 n, im, i = k
+                # convert images to tensors
                 inputs[(n, im, i)] = self.to_tensor(f)
+                # augment images
                 inputs[(n + "_aug", im, i)] = self.to_tensor(color_aug(f))
+            elif "mask" in k:
+                n, im, i = k
+                # convert masks to tensors
+                if self.seg_mask != 'none':
+                    inputs[(n, im, i)] = torch.from_numpy(np.array(f))
+                else:
+                    inputs[(n, im, i)] = self.to_tensor(f)
+            elif "radar" in k or "lidar" in k:
+                n, im, i = k
+                inputs[(n, im, i)] = torch.from_numpy(np.array(f))
+
+        if self.seg_mask != 'none':
+            self.process_masks(inputs, self.seg_mask)
+
+            if random.random() < self.prob_to_mask_objects:
+                self.mask_objects(inputs)
+
+    def process_masks(self, inputs, mask_mode):
+        """
+        """
+        MIN_OBJECT_AREA = self.MIN_OBJECT_AREA
+
+        for scale in range(self.num_scales):
+
+            if mask_mode == 'color':
+                object_ids = torch.unique(torch.cat(
+                    [inputs['mask', fid, scale] for fid in self.frame_idxs]),
+                    sorted=True)
+            else:
+                object_ids = torch.Tensor([0, 255])
+
+            for fid in self.frame_idxs:
+                current_mask = inputs['mask', fid, scale]
+
+                def process_obj_mask(obj_id, mask_mode=mask_mode):
+                    """Create a mask for obj_id, skipping the background mask."""
+                    if mask_mode == 'color':
+                        mask = torch.logical_and(
+                                torch.eq(current_mask, obj_id),
+                                torch.ne(current_mask, 0)
+                                )
+                    else:
+                        mask = torch.ne(current_mask, 0)
+
+                    # TODO early return when obj_id == 0
+                    # Leave out very small masks, that are most often errors.
+                    obj_size = torch.sum(mask)
+                    if MIN_OBJECT_AREA != 0:
+                        mask = torch.logical_and(mask, obj_size > MIN_OBJECT_AREA)
+                    if not self.boxify:
+                      return mask
+                    # Complete the mask to its bounding box.
+                    binary_obj_masks_y = torch.any(mask, axis=1, keepdim=True)
+                    binary_obj_masks_x = torch.any(mask, axis=0, keepdim=True)
+                    return torch.logical_and(binary_obj_masks_y, binary_obj_masks_x)
+
+                object_mask = torch.stack(
+                        list(map(process_obj_mask, object_ids))
+                        )
+                object_mask = torch.any(object_mask, axis=0, keepdim=True)
+                inputs['mask', fid, scale] = object_mask.to(torch.float32)
+
+    def get_image(self, image, do_flip, crop_offset=-3):
+        r"""
+        Resize (and crop) an image to specified height and width.
+        crop_offset is an integer representing how the image will be cropped:
+            -3      the image will not be cropped
+            -2      the image will be center-cropped
+            -1      the image will be cropped by a random offset
+            >0      the image will be cropped by this offset
+        """
+        # If crop_offset is set to -3, crop the image since the top
+        # Resize the image to (self.height, self.width).
+        if crop_offset == -3:            
+            image, ratio, delta_u, delta_v = image_resize(image, self.height,
+                                                        self.width, 0.0, 0.0) 
+        # Otherwise resize the image according to self.width, 
+        # and then crop the image to self.height according to crop_offset.
+        else:
+            raw_w, raw_h = image.size
+            resize_w = self.width
+            resize_h = int(raw_h * resize_w / raw_w)
+            image, ratio, delta_u, delta_v = image_resize(image, resize_h,
+                                                          resize_w, 0.0, 0.0)
+            top = int(self.crop_bound[0] * resize_h)
+            if len(self.crop_bound) == 1:
+                bottom = top
+            elif len(self.crop_bound) == 2:
+                bottom = int(self.crop_bound[1] * resize_h) - self.height
+            else:
+                raise NotImplementedError
+
+            if crop_offset == -1:
+                assert bottom >= top, "Not enough height to crop, please set a larger crop_bound range"
+                # add one to include the upper limit for sampling
+                crop_offset = np.random.randint(top, bottom + 1)
+            elif crop_offset == -2:
+                crop_offset = int((top+bottom)/2)
+
+            image = np.array(image)
+            image = image[crop_offset: crop_offset + self.height]
+            image = Image.fromarray(image)
+            delta_v += crop_offset
+
+        # if the principal point is not at center,
+        # flipping would affect the camera intrinsics but not accounted here
+        if do_flip:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+
+        return image, ratio, delta_u, delta_v, crop_offset
+
+    def adjust_intrinsics(self, cam_intrinsics_mat, inputs, ratio, delta_u, delta_v, do_flip):
+        """Adjust intrinsics to match each scale and store to inputs"""
+
+
+        for scale in range(self.num_scales):
+            
+            K = cam_intrinsics_mat.copy()
+
+            # adjust K for the resizing within the get_color function
+            K[0, :] *= ratio
+            K[1, :] *= ratio
+            K[0,2] -= delta_u
+            K[1,2] -= delta_v
+
+            # Modify the intrinsic matrix if the image is flipped
+            if do_flip:
+                K[0,2] = self.width - K[0,2]
+            
+            # adjust K for images of different scales
+            K[0, :] /= (2 ** scale)
+            K[1, :] /= (2 ** scale)
+
+            inv_K = np.linalg.pinv(K)
+
+            # add intrinsics to inputs
+            inputs[("K", scale)] = torch.from_numpy(K)
+            inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
+
+    def mask_objects(self, inputs):
+        """Mask objects overlapping with mobile masks"""
+        for scale in range(self.num_scales):
+            for fid in self.frame_idxs:
+                inputs['color_aug', fid, scale] *= (1 - inputs['mask', fid, scale])
+                inputs['color', fid, scale] *= (1 - inputs['mask', fid, scale])
 
     def __len__(self):
         return len(self.filenames)
@@ -135,12 +310,19 @@ class MonoDataset(data.Dataset):
             2       images resized to (self.width // 4, self.height // 4)
             3       images resized to (self.width // 8, self.height // 8)
         """
+        # an empty dictionary
         inputs = {}
 
+        # do augmentation?
         do_color_aug = self.is_train and random.random() > 0.5
+        do_color_aug = (not self.not_do_color_aug) and do_color_aug
+        # do flipping
         do_flip = self.is_train and random.random() > 0.5
+        do_flip = (not self.not_do_flip) and do_flip
 
         line = self.filenames[index].split()
+
+        # ex: 2011_09_26/2011_09_26_drive_0022_sync
         folder = line[0]
 
         if len(line) == 3:
@@ -149,16 +331,23 @@ class MonoDataset(data.Dataset):
             frame_index = 0
 
         if len(line) == 3:
+            # r or l
             side = line[2]
         else:
             side = None
 
+        # add the images of the original scale to the inputs
         for i in self.frame_idxs:
-            if i == "s":
+            if i == "s": # this might be for stereo data
                 other_side = {"r": "l", "l": "r"}[side]
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
+                inputs[("color", i, -1)] = self.get_color(
+                        folder, frame_index, other_side, do_flip
+                        )
             else:
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+                # get_color is to load the specified image
+                inputs[("color", i, -1)] = self.get_color(
+                        folder, frame_index + i, side, do_flip
+                        )
 
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):
@@ -169,10 +358,12 @@ class MonoDataset(data.Dataset):
 
             inv_K = np.linalg.pinv(K)
 
+            # add intrinsics to inputs
             inputs[("K", scale)] = torch.from_numpy(K)
             inputs[("inv_K", scale)] = torch.from_numpy(inv_K)
 
         if do_color_aug:
+            # return a transform
             color_aug = transforms.ColorJitter.get_params(
                 self.brightness, self.contrast, self.saturation, self.hue)
         else:
@@ -180,6 +371,7 @@ class MonoDataset(data.Dataset):
 
         self.preprocess(inputs, color_aug)
 
+        # delete the images of original scale
         for i in self.frame_idxs:
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
@@ -200,6 +392,9 @@ class MonoDataset(data.Dataset):
         return inputs
 
     def get_color(self, folder, frame_index, side, do_flip):
+        raise NotImplementedError
+
+    def get_mask(self, folder, frame_index, side, do_flip):
         raise NotImplementedError
 
     def check_depth(self):
