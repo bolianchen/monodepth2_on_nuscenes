@@ -135,38 +135,66 @@ class MonodepthOptions:
                             default ="v1.0-mini",
                             choices=["v1.0-mini", "v1.0-trainval", "v1.0-test"],
                             help="nuscenes dataset version")
+        self.parser.add_argument("--subset_ratio",
+                                 type=float,
+                                 default=1.0,
+                                 help="random sample a subset of scenes in "
+                                      "the train and val datasets, respectively"
+                                      " ; at least one scene would be sampled") 
         self.parser.add_argument("--camera_channels",
                             default =["CAM_FRONT"],
                             nargs="+",
                             help="selectable from CAM_FRONT, CAM_FRONT_LEFT, "
                                  "CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, "
                                  "CAM_BACK_RIGHT")
+        self.parser.add_argument("--pass_filters",
+                                 nargs="+",
+                                 type=str,
+                                 default=['day', 'night', 'rain'],
+                                 help="['day', 'night', 'rain']: all the scenes; "
+                                      "['day']: daytime and not rainy scenes; "
+                                      "['night']: nighttime and not rainy scenes; "
+                                      "['rain']: rainy scenes on both daytime and nighttime; "
+                                      "['day', 'night']: daytime, nighttime, and not rainy scenes; "
+                                      "['day', 'rain']: rainy scenes on daytime; "
+                                      "['night', 'rain']: rainy scenes on nighttime;")
         self.parser.add_argument("--use_keyframe",
                                  action="store_true",
                                  help="whether to use keyframes "
                                       "there are two categories: "
                                       "1. sample_data frames in 12Hz (default) "
                                       "2. keyframes in 2Hz")
-        self.parser.add_argument("--enforce_adj_nonkeyframe",
-                                 action="store_true",
-                                 help="this option only effective when "
-                                      "use_keyframe is set True: "
-                                      "if True, adjacent non-keyframes would "
-                                      " be paired with the central keyframe "
-                                      "for image construction; "
-                                      "if False, all adjacent and central "
-                                      "frames would be keyframes")
         self.parser.add_argument("--stationary_filter",
                                  action="store_true",
                                  help="set True to filter out "
                                       "non-movable objects including "
                                       "traffic cones, barriers, "
                                       "debris and bicycle racks")
-        self.parser.add_argument("--speed_limits",
+        self.parser.add_argument("--speed_bound",
                             default=[0, np.inf],
                             type=float,
                             nargs="+",
                             help="lower and upper speed limits to screen samples")
+        self.parser.add_argument("--how_to_gen_masks",
+                                 type=str,
+                                 choices=["maskrcnn", "bbox", "black"],
+                                 default="black",
+                                 help="maskrcnn - generate segmentation masks "
+                                      " with a Mask R-CNN model pretrained on "
+                                      "COCO and save alongside the camera "
+                                      "images in disk. Each mask would have "
+                                      "the same name with the correponding "
+                                      "image except for the suffix -fseg ")
+        self.parser.add_argument("--maskrcnn_batch_size",
+                                 type=int,
+                                 help="batch size",
+                                 default=4)
+        self.parser.add_argument("--regen_masks",
+                                 help="if set and how_to_gen_masks=maskrcnn "
+                                      "existing mask-rcnnmasks would be "
+                                      "overwritten; this may be used when "
+                                      "trying different seg_mask options",
+                                 action="store_true")
         self.parser.add_argument("--use_radar",
                                  help="if set, uses radar data for training",
                                  action="store_true")

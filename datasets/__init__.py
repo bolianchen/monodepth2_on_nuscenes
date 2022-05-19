@@ -13,5 +13,5 @@ STATIONARY_CATEGORIES={'movable_object.trafficcone', 'movable_object.barrier',
                        'movable_object.debris', 'static_object.bicycle_rack'}
 from .kitti_dataset import KITTIRAWDataset, KITTIOdomDataset, \
         KITTIDepthDataset 
-from .nuscenes_dataset import NuScenesDataset, NuScenesProcessor
+from .nuscenes_dataset import NuScenesDataset
 

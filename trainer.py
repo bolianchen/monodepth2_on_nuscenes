@@ -20,6 +20,7 @@ import json
 from utils import *
 from kitti_utils import *
 from layers import *
+from lib.dataset_processors import NuScenesProcessor
 
 import datasets
 import networks
@@ -118,21 +119,29 @@ class Trainer:
         self.dataset = datasets_dict[self.opt.dataset]
 
         if self.opt.dataset == 'nuscenes':
-            nusc_processor = datasets.NuScenesProcessor(
+            nusc_processor = NuScenesProcessor(
 		    self.opt.nuscenes_version, self.opt.data_path,
-                    self.opt.frame_ids, speed_limits=self.opt.speed_limits,
+                    self.opt.frame_ids, speed_bound=self.opt.speed_bound,
 		    camera_channels=self.opt.camera_channels,
+                    pass_filters=self.opt.pass_filters,
                     use_keyframe=self.opt.use_keyframe,
-                    stationary_filter=self.opt.stationary_filter)
-            train_filenames = nusc_processor
-            val_filenames = nusc_processor
-            num_train_samples = len(train_filenames.gen_tokens())
+                    stationary_filter=self.opt.stationary_filter,
+                    seg_mask=self.opt.seg_mask,
+                    how_to_gen_masks=self.opt.how_to_gen_masks,
+                    maskrcnn_batch_size=self.opt.maskrcnn_batch_size,
+                    regen_masks=self.opt.regen_masks,
+                    subset_ratio=self.opt.subset_ratio)
+            train_filenames = nusc_processor.gen_tokens(is_train=True)
+            val_filenames = nusc_processor.gen_tokens(is_train=False)
+            num_train_samples = len(train_filenames)
+            proc = nusc_processor
         else:
             fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
 
             train_filenames = readlines(fpath.format("train"))
             val_filenames = readlines(fpath.format("val"))
             num_train_samples = len(train_filenames)
+            proc = None
 
         self.num_total_steps = (
                 num_train_samples // self.opt.batch_size * self.opt.num_epochs)
@@ -147,9 +156,8 @@ class Trainer:
             seg_mask=self.opt.seg_mask, boxify=self.opt.boxify,
             MIN_OBJECT_AREA=self.opt.MIN_OBJECT_AREA,
             use_radar=self.opt.use_radar, use_lidar=self.opt.use_lidar,
-            min_depth=self.opt.min_depth, max_depth=self.opt.max_depth,
             prob_to_mask_objects=self.opt.prob_to_mask_objects,
-            enforce_adj_nonkeyframe = self.opt.enforce_adj_nonkeyframe)
+            proc=proc)
 
         self.train_loader = DataLoader(
             train_dataset, self.opt.batch_size, True,
@@ -164,9 +172,8 @@ class Trainer:
             seg_mask=self.opt.seg_mask, boxify=self.opt.boxify,
             MIN_OBJECT_AREA=self.opt.MIN_OBJECT_AREA,
             use_radar=self.opt.use_radar, use_lidar=self.opt.use_lidar,
-            min_depth=self.opt.min_depth, max_depth=self.opt.max_depth,
             prob_to_mask_objects=0.0,
-            enforce_adj_nonkeyframe=self.opt.enforce_adj_nonkeyframe)
+            proc=proc)
 
         self.val_loader = DataLoader(
             val_dataset, self.opt.batch_size, True,
